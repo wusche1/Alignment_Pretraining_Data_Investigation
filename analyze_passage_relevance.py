@@ -5,11 +5,11 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 import json
 import asyncio
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from datasets import load_dataset
-import numpy as np
 
 load_dotenv()
 
@@ -64,23 +64,12 @@ async def evaluate_batch_async(
     passages: list[str],
     questions: list[str],
     model: str = MODEL,
-    batch_size: int = 10,
 ) -> list[dict]:
-    """Evaluate in batches to avoid rate limits."""
-    results = []
-    for i in range(0, len(passages), batch_size):
-        batch_passages = passages[i:i + batch_size]
-        batch_questions = questions[i:i + batch_size]
-        print(f"  Processing batch {i // batch_size + 1}/{(len(passages) + batch_size - 1) // batch_size}")
-        batch_results = await asyncio.gather(*[
-            _evaluate_relevance_async(passage, question, model)
-            for passage, question in zip(batch_passages, batch_questions)
-        ])
-        results.extend(batch_results)
-        # Small delay between batches to avoid rate limits
-        if i + batch_size < len(passages):
-            await asyncio.sleep(1)
-    return results
+    """Evaluate all passages/questions in parallel."""
+    return await asyncio.gather(*[
+        _evaluate_relevance_async(passage, question, model)
+        for passage, question in zip(passages, questions)
+    ])
 
 
 def load_full_dataset():
@@ -122,7 +111,137 @@ def load_full_dataset():
     return article_data, textbook_data
 
 
-def main():
+def load_existing_results():
+    """Load existing results and return set of already processed textbook IDs."""
+    output_file = RESULTS_DIR / "passage_relevance_analysis.json"
+    if output_file.exists():
+        with open(output_file) as f:
+            results = json.load(f)
+        return {r["textbook_question_id"] for r in results}
+    return set()
+
+
+def append_result(result: dict):
+    """Append a single result to the JSON file."""
+    output_file = RESULTS_DIR / "passage_relevance_analysis.json"
+
+    if output_file.exists():
+        with open(output_file) as f:
+            results = json.load(f)
+    else:
+        results = []
+
+    results.append(result)
+
+    with open(output_file, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+async def process_single_textbook_question(
+    textbook_id: str,
+    textbook_q: dict,
+    top_matches: list,
+    article_data: dict,
+) -> dict:
+    """Process a single textbook question and return structured result."""
+    passages = []
+    questions = []
+    metadata = []
+
+    for match in top_matches:
+        article_id = match["question_id"]
+        article_q = article_data[article_id]
+        article_passage = article_q["passage"]
+
+        # Evaluation 1: Article question with its own passage
+        passages.append(article_passage)
+        questions.append(article_q["question"])
+        metadata.append({
+            "article_question_id": article_id,
+            "similarity": match["similarity"],
+            "eval_type": "article_question_with_passage",
+        })
+
+        # Evaluation 2: Textbook question with the article's passage
+        passages.append(article_passage)
+        questions.append(textbook_q["question"])
+        metadata.append({
+            "article_question_id": article_id,
+            "similarity": match["similarity"],
+            "eval_type": "textbook_question_with_article_passage",
+        })
+
+    # Run evaluations for this textbook question
+    results = await evaluate_batch_async(passages, questions)
+
+    # Structure the results
+    matches_dict = {}
+    for meta, result in zip(metadata, results):
+        art_id = meta["article_question_id"]
+        if art_id not in matches_dict:
+            matches_dict[art_id] = {
+                "similarity": meta["similarity"],
+                "article_with_passage": None,
+                "textbook_with_passage": None,
+            }
+
+        eval_data = {
+            "passage_id": art_id,
+            "question_id": art_id if meta["eval_type"] == "article_question_with_passage" else textbook_id,
+            "justification": result.get("justification", ""),
+            "rating": result.get("relevance_rating", 0),
+        }
+
+        if meta["eval_type"] == "article_question_with_passage":
+            matches_dict[art_id]["article_with_passage"] = eval_data
+        else:
+            matches_dict[art_id]["textbook_with_passage"] = eval_data
+
+    # Convert to final structure
+    match_list = []
+    for art_id, match_data in matches_dict.items():
+        match_list.append({
+            "article_question_id": art_id,
+            "embedding_similarity": match_data["similarity"],
+            "article_question_with_article_passage": match_data["article_with_passage"],
+            "textbook_question_with_article_passage": match_data["textbook_with_passage"],
+        })
+    match_list.sort(key=lambda x: x["embedding_similarity"], reverse=True)
+
+    return {
+        "textbook_question_id": textbook_id,
+        "matches": match_list,
+    }
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds into human readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
+
+
+async def process_batch_of_questions(
+    batch: list[dict],
+    textbook_data: dict,
+    article_data: dict,
+) -> list[dict]:
+    """Process a batch of textbook questions in parallel."""
+    tasks = []
+    for result in batch:
+        textbook_id = result["textbook_question_id"]
+        textbook_q = textbook_data[textbook_id]
+        top_2_matches = result["top_5_matches"][:2]
+        tasks.append(process_single_textbook_question(
+            textbook_id, textbook_q, top_2_matches, article_data
+        ))
+    return await asyncio.gather(*tasks)
+
+
+async def main_async():
     # Load similarity results
     with open(RESULTS_DIR / "textbook_similarity_analysis.json") as f:
         similarity_results = json.load(f)
@@ -130,137 +249,64 @@ def main():
     # Load full dataset with passages
     article_data, textbook_data = load_full_dataset()
 
-    # Sample 20% of textbook questions
-    np.random.seed(42)
-    sample_size = max(1, len(similarity_results) // 5)  # 20%
-    sample_indices = np.random.choice(len(similarity_results), sample_size, replace=False)
-    sampled_results = [similarity_results[i] for i in sample_indices]
+    # Load already processed IDs
+    processed_ids = load_existing_results()
+    total_questions = len(similarity_results)
+    skipped = len(processed_ids)
 
-    print(f"Sampled {len(sampled_results)} textbook questions (20% of {len(similarity_results)})")
+    # Filter to unprocessed
+    to_process = [r for r in similarity_results if r["textbook_question_id"] not in processed_ids]
+    remaining = len(to_process)
 
-    # Prepare evaluation requests
-    passages = []
-    questions = []
-    metadata = []  # Track which evaluation this is
+    print(f"\n{'='*60}")
+    print(f"Total textbook questions: {total_questions}")
+    print(f"Already processed (skipping): {skipped}")
+    print(f"Remaining to process: {remaining}")
+    print(f"Model: {MODEL}")
+    print(f"{'='*60}\n")
 
-    for result in sampled_results:
-        textbook_id = result["textbook_question_id"]
-        textbook_q = textbook_data[textbook_id]
+    if remaining == 0:
+        print("Nothing to process!")
+        return
 
-        # Get top 2 matches
-        top_2_matches = result["top_5_matches"][:2]
+    batch_size = 50
+    processed_count = 0
+    start_time = time.time()
 
-        for match in top_2_matches:
-            article_id = match["question_id"]
-            article_q = article_data[article_id]
-            article_passage = article_q["passage"]
+    for batch_start in range(0, remaining, batch_size):
+        batch_end = min(batch_start + batch_size, remaining)
+        batch = to_process[batch_start:batch_end]
 
-            # Evaluation 1: Article question with its own passage
-            passages.append(article_passage)
-            questions.append(article_q["question"])
-            metadata.append({
-                "textbook_question_id": textbook_id,
-                "article_question_id": article_id,
-                "similarity": match["similarity"],
-                "eval_type": "article_question_with_passage",
-            })
+        batch_start_time = time.time()
+        results = await process_batch_of_questions(batch, textbook_data, article_data)
 
-            # Evaluation 2: Textbook question with the article's passage
-            passages.append(article_passage)
-            questions.append(textbook_q["question"])
-            metadata.append({
-                "textbook_question_id": textbook_id,
-                "article_question_id": article_id,
-                "similarity": match["similarity"],
-                "eval_type": "textbook_question_with_article_passage",
-            })
+        for result in results:
+            append_result(result)
 
-    print(f"Prepared {len(passages)} evaluations")
-    print(f"Using model: {MODEL}")
+        processed_count += len(batch)
+        batch_time = time.time() - batch_start_time
+        elapsed = time.time() - start_time
 
-    # Run evaluations
-    print("\nRunning GPT evaluations...")
-    results = asyncio.run(evaluate_batch_async(passages, questions))
+        # Calculate ETA
+        avg_time_per_item = elapsed / processed_count
+        remaining_items = remaining - processed_count
+        eta_seconds = avg_time_per_item * remaining_items
 
-    # Combine results with metadata into flat list first
-    flat_results = []
-    for meta, result in zip(metadata, results):
-        flat_results.append({
-            **meta,
-            "justification": result.get("justification", ""),
-            "relevance_rating": result.get("relevance_rating", 0),
-        })
+        print(f"[{skipped + processed_count}/{total_questions}] "
+              f"Batch of {len(batch)} done in {batch_time:.1f}s | "
+              f"Elapsed: {format_time(elapsed)} | "
+              f"ETA: {format_time(eta_seconds)} | "
+              f"Speed: {processed_count / elapsed:.1f}/s")
 
-    # Restructure into hierarchical format:
-    # textbook_question -> matches[] -> {article_with_passage, textbook_with_passage}
-    structured_results = []
+    total_time = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"Done! Processed {processed_count} questions in {format_time(total_time)}")
+    print(f"Total in database: {skipped + processed_count}")
+    print(f"{'='*60}")
 
-    # Group by textbook question
-    textbook_groups = {}
-    for r in flat_results:
-        tb_id = r["textbook_question_id"]
-        if tb_id not in textbook_groups:
-            textbook_groups[tb_id] = {}
 
-        art_id = r["article_question_id"]
-        if art_id not in textbook_groups[tb_id]:
-            textbook_groups[tb_id][art_id] = {
-                "similarity": r["similarity"],
-                "article_with_passage": None,
-                "textbook_with_passage": None,
-            }
-
-        eval_data = {
-            "passage_id": art_id,  # passage comes from article
-            "question_id": art_id if r["eval_type"] == "article_question_with_passage" else tb_id,
-            "justification": r["justification"],
-            "rating": r["relevance_rating"],
-        }
-
-        if r["eval_type"] == "article_question_with_passage":
-            textbook_groups[tb_id][art_id]["article_with_passage"] = eval_data
-        else:
-            textbook_groups[tb_id][art_id]["textbook_with_passage"] = eval_data
-
-    # Convert to final structure
-    for tb_id, matches in textbook_groups.items():
-        match_list = []
-        for art_id, match_data in matches.items():
-            match_list.append({
-                "article_question_id": art_id,
-                "embedding_similarity": match_data["similarity"],
-                "article_question_with_article_passage": match_data["article_with_passage"],
-                "textbook_question_with_article_passage": match_data["textbook_with_passage"],
-            })
-        # Sort by similarity descending
-        match_list.sort(key=lambda x: x["embedding_similarity"], reverse=True)
-
-        structured_results.append({
-            "textbook_question_id": tb_id,
-            "matches": match_list,
-        })
-
-    # Save results
-    output_file = RESULTS_DIR / "passage_relevance_analysis.json"
-    with open(output_file, "w") as f:
-        json.dump(structured_results, f, indent=2)
-    print(f"\nSaved {len(structured_results)} textbook question analyses to {output_file}")
-
-    # Summary statistics
-    article_ratings = [r["relevance_rating"] for r in flat_results if r["eval_type"] == "article_question_with_passage"]
-    textbook_ratings = [r["relevance_rating"] for r in flat_results if r["eval_type"] == "textbook_question_with_article_passage"]
-
-    print(f"\n{'='*80}")
-    print("SUMMARY STATISTICS")
-    print(f"{'='*80}")
-
-    print(f"\nArticle questions with their own passages:")
-    print(f"  Mean rating: {np.mean(article_ratings):.2f}")
-    print(f"  Median rating: {np.median(article_ratings):.2f}")
-
-    print(f"\nTextbook questions with article passages:")
-    print(f"  Mean rating: {np.mean(textbook_ratings):.2f}")
-    print(f"  Median rating: {np.median(textbook_ratings):.2f}")
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
